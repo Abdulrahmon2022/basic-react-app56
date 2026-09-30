@@ -1,9 +1,24 @@
 import { useCallback, useEffect, useState } from "react";
+import { BrowserProvider, formatEther } from "ethers";
 
-// Only these chains are allowed. Users change chains inside their wallet.
+// Only these chains are allowed. Users can switch to either from the app.
 const SUPPORTED_CHAINS = {
-  1: "Ethereum Mainnet",
-  8453: "Base",
+  1: {
+    name: "Ethereum Mainnet",
+    chainId: "0x1",
+    chainName: "Ethereum Mainnet",
+    nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+    rpcUrls: ["https://ethereum-rpc.publicnode.com"],
+    blockExplorerUrls: ["https://etherscan.io"],
+  },
+  8453: {
+    name: "Base",
+    chainId: "0x2105",
+    chainName: "Base",
+    nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+    rpcUrls: ["https://mainnet.base.org"],
+    blockExplorerUrls: ["https://basescan.org"],
+  },
 };
 
 const isSupported = (id) =>
@@ -24,6 +39,9 @@ const Eip6963 = () => {
   const [activeProvider, setActiveProvider] = useState(null);
   const [account, setAccount] = useState("");
   const [chainId, setChainId] = useState(0);
+  const [targetChainId, setTargetChainId] = useState(1);
+  const [balance, setBalance] = useState("");
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [connectError, setConnectError] = useState("");
 
   // Derived on every render, so the error appears/disappears in the same
@@ -32,9 +50,11 @@ const Eip6963 = () => {
   const unsupportedError = unsupportedChain
     ? `Chain ${chainId} is not supported. Open your wallet and switch to ${Object.values(
         SUPPORTED_CHAINS
-      ).join(" or ")}.`
+      )
+        .map((chain) => chain.name)
+        .join(" or ")}.`
     : "";
-  const error = unsupportedError || connectError;
+  const error = connectError || unsupportedError;
 
   // Discover wallets (EIP-6963), dedupe by uuid, and clean up the listener.
   useEffect(() => {
@@ -57,6 +77,7 @@ const Eip6963 = () => {
     setActiveProvider(null);
     setAccount("");
     setChainId(0);
+    setBalance("");
     setConnectError("");
   }, []);
 
@@ -77,9 +98,16 @@ const Eip6963 = () => {
 
     const onAccountsChanged = (accounts) => {
       if (!accounts.length) resetState();
-      else setAccount(accounts[0]);
+      else {
+        setAccount(accounts[0]);
+        setBalance("");
+      }
     };
-    const onChainChanged = (id) => setChainId(normalizeChainId(id));
+    const onChainChanged = (chainIdHex) => {
+      setChainId(normalizeChainId(chainIdHex));
+      setBalance("");
+      setConnectError("");
+    };
     const onDisconnect = () => resetState();
 
     activeProvider.on?.("accountsChanged", onAccountsChanged);
@@ -117,6 +145,7 @@ const Eip6963 = () => {
 
       setChainId(normalizeChainId(id));
       setAccount(accounts[0]);
+      setBalance("");
       setActiveProvider(provider);
     } catch (err) {
       console.error(err);
@@ -125,6 +154,77 @@ const Eip6963 = () => {
           ? "Connection request was rejected."
           : "Failed to connect wallet."
       );
+    }
+  };
+
+  const handleRefresh = async () => {
+    if (!activeProvider || !isSupported(chainId)) return;
+
+    setIsRefreshing(true);
+    setConnectError("");
+    try {
+      const [accounts, id] = await Promise.all([
+        activeProvider.request({ method: "eth_accounts" }),
+        activeProvider.request({ method: "eth_chainId" }),
+      ]);
+
+      if (!accounts.length) {
+        resetState();
+        return;
+      }
+
+      const walletProvider = new BrowserProvider(activeProvider);
+      const latestBalance = await walletProvider.getBalance(accounts[0]);
+
+      setAccount(accounts[0]);
+      setChainId(normalizeChainId(id));
+      setBalance(formatEther(latestBalance));
+    } catch (err) {
+      console.error("Could not refresh wallet data:", err);
+      setConnectError("Failed to refresh wallet data.");
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
+  const handleSwitchChain = async () => {
+    if (!activeProvider) return;
+
+    const targetChain = SUPPORTED_CHAINS[targetChainId];
+    setConnectError("");
+    try {
+      await activeProvider.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: targetChain.chainId }],
+      });
+    } catch (err) {
+      if (err?.code === 4902) {
+        try {
+          await activeProvider.request({
+            method: "wallet_addEthereumChain",
+            params: [targetChain],
+          });
+          await activeProvider.request({
+            method: "wallet_switchEthereumChain",
+            params: [{ chainId: targetChain.chainId }],
+          });
+        } catch (addError) {
+          console.error("Could not add the selected network:", addError);
+          setConnectError(
+            addError?.code === 4001
+              ? "Adding the network was rejected."
+              : "Could not add the selected network to your wallet."
+          );
+          return;
+        }
+      } else {
+        console.error("Could not switch networks:", err);
+        setConnectError(
+          err?.code === 4001
+            ? "Network switch was rejected."
+            : "Could not switch networks."
+        );
+      }
     }
   };
 
@@ -172,14 +272,39 @@ const Eip6963 = () => {
 
       {account && (
         <div>
-          <h2>Connection Established</h2>
+          <h2>Connection Established!</h2>
 
           <p>Account Connected: {account}</p>
           <p>
             Chain connected: {chainId}
-            {isSupported(chainId) && ` (${SUPPORTED_CHAINS[chainId]})`}
+            {isSupported(chainId) && ` (${SUPPORTED_CHAINS[chainId].name})`}
           </p>
+          <p>Balance: {balance ? `${balance} ETH` : "Not loaded"}</p>
 
+          {unsupportedChain && (
+            <div>
+              <label htmlFor="target-chain">Switch to: </label>
+              <select
+                id="target-chain"
+                value={targetChainId}
+                onChange={(event) => setTargetChainId(Number(event.target.value))}
+              >
+                {Object.entries(SUPPORTED_CHAINS).map(([id, chain]) => (
+                  <option key={id} value={id}>
+                    {chain.name}
+                  </option>
+                ))}
+              </select>
+              <button onClick={handleSwitchChain}>Switch network</button>
+            </div>
+          )}
+
+          <button
+            onClick={handleRefresh}
+            disabled={isRefreshing || unsupportedChain}
+          >
+            {isRefreshing ? "Refreshing..." : "Refresh"}
+          </button>
           <button onClick={handleDisconnect}>Disconnect</button>
         </div>
       )}
